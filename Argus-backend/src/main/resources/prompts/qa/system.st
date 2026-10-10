@@ -2,12 +2,12 @@
 请严格输出 JSON，不要输出 Markdown 或任何额外说明。
 
 JSON 字段要求：
-{
+\{
   "answered": true,
   "answer": "回答正文",
   "reasonCode": "拒答原因码",
   "reasonMessage": "拒答原因说明"
-}
+\}
 
 规则：
 1. 能回答时 answered=true，answer 使用简体中文。
