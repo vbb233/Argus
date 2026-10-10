@@ -7,6 +7,7 @@ import com.argus.rag.metrics.LlmEndpoint;
 import com.argus.rag.metrics.LlmModule;
 import com.argus.rag.metrics.collector.LlmUsageCollector;
 import com.argus.rag.metrics.cost.LlmCostCalculator;
+import com.argus.rag.metrics.cost.LlmProperties;
 import com.argus.rag.metrics.model.dto.LlmUsageRecordDTO;
 import com.argus.rag.qa.model.EvidenceLevel;
 import com.argus.rag.qa.model.dto.AskQuestionRequest;
@@ -34,7 +35,6 @@ import java.util.concurrent.atomic.AtomicReference;
 public class QaService {
 
     private static final Logger log = LoggerFactory.getLogger(QaService.class);
-    private static final String MODEL_NAME = "qwen-plus";
     private static final String INSUFFICIENT_EVIDENCE_CODE = "INSUFFICIENT_EVIDENCE";
     private static final String SYSTEM_ERROR_CODE = "SYSTEM_ERROR";
 
@@ -44,6 +44,7 @@ public class QaService {
     private final LlmUsageCollector llmUsageCollector;
     private final LlmCostCalculator llmCostCalculator;
     private final QaRecordPersistenceService qaRecordPersistenceService;
+    private final LlmProperties llmProperties;
 
     /**
      * 构造函数。
@@ -53,6 +54,8 @@ public class QaService {
      * @param currentUserService     当前用户服务，用于获取当前登录用户
      * @param llmUsageCollector      LLM 用量采集器
      * @param llmCostCalculator      LLM 费用计算器
+     * @param qaRecordPersistenceService 问答记录持久化服务
+     * @param llmProperties          LLM 计量配置（提供实际使用的模型名）
      */
     public QaService(
             GroupMembershipService groupMembershipService,
@@ -60,13 +63,15 @@ public class QaService {
             CurrentUserService currentUserService,
             LlmUsageCollector llmUsageCollector,
             LlmCostCalculator llmCostCalculator,
-            QaRecordPersistenceService qaRecordPersistenceService) {
+            QaRecordPersistenceService qaRecordPersistenceService,
+            LlmProperties llmProperties) {
         this.groupMembershipService = groupMembershipService;
         this.qaChatService = qaChatService;
         this.currentUserService = currentUserService;
         this.llmUsageCollector = llmUsageCollector;
         this.llmCostCalculator = llmCostCalculator;
         this.qaRecordPersistenceService = qaRecordPersistenceService;
+        this.llmProperties = llmProperties;
     }
 
     /**
@@ -118,7 +123,7 @@ public class QaService {
                 groupId,
                 question,
                 endpoint,
-                MODEL_NAME,
+                llmProperties.getChatModel(),
                 response,
                 evidenceLevel,
                 usage,
@@ -212,7 +217,7 @@ public class QaService {
     private void recordUsage(Long userId, Long groupId, String endpoint,
                              QaChatService.UsageInfo usage, boolean success, String errorMessage) {
         try {
-            BigDecimal cost = llmCostCalculator.calculate(MODEL_NAME, usage.promptTokens(), usage.completionTokens());
+            BigDecimal cost = llmCostCalculator.calculate(llmProperties.getChatModel(), usage.promptTokens(), usage.completionTokens());
             LlmUsageRecordDTO dto = LlmUsageRecordDTO.builder()
                     .userId(userId)
                     .groupId(groupId)
@@ -226,7 +231,7 @@ public class QaService {
                     .latencyMs(usage.latencyMs())
                     .success(success)
                     .errorMessage(errorMessage)
-                    .modelName(MODEL_NAME)
+                    .modelName(llmProperties.getChatModel())
                     .build();
             llmUsageCollector.record(dto);
         } catch (Exception e) {

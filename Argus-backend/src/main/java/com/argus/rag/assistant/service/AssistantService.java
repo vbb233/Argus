@@ -20,6 +20,7 @@ import com.argus.rag.metrics.LlmEndpoint;
 import com.argus.rag.metrics.LlmModule;
 import com.argus.rag.metrics.collector.LlmUsageCollector;
 import com.argus.rag.metrics.cost.LlmCostCalculator;
+import com.argus.rag.metrics.cost.LlmProperties;
 import com.argus.rag.metrics.model.dto.LlmUsageRecordDTO;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -43,9 +44,9 @@ public class AssistantService {
     private final ObjectMapper objectMapper;
     private final LlmUsageCollector llmUsageCollector;
     private final LlmCostCalculator llmCostCalculator;
+    private final LlmProperties llmProperties;
 
     private static final Logger log = LoggerFactory.getLogger(AssistantService.class);
-    private static final String MODEL_NAME = "qwen-plus";
     private static final int TOKEN_ESTIMATE_DIVISOR = 4;
 
     public AssistantService(
@@ -55,7 +56,8 @@ public class AssistantService {
             CurrentUserService currentUserService,
             ObjectMapper objectMapper,
             LlmUsageCollector llmUsageCollector,
-            LlmCostCalculator llmCostCalculator
+            LlmCostCalculator llmCostCalculator,
+            LlmProperties llmProperties
     ) {
         this.assistantConversationService = assistantConversationService;
         this.assistantAgentFacade = assistantAgentFacade;
@@ -64,6 +66,7 @@ public class AssistantService {
         this.objectMapper = objectMapper;
         this.llmUsageCollector = llmUsageCollector;
         this.llmCostCalculator = llmCostCalculator;
+        this.llmProperties = llmProperties;
     }
 
     /**
@@ -399,7 +402,7 @@ public class AssistantService {
             int completionTokens = estimateTokens(reply);
             int totalTokens = promptTokens + completionTokens;
 
-            BigDecimal costAmount = llmCostCalculator.calculate(MODEL_NAME, promptTokens, completionTokens);
+            BigDecimal costAmount = llmCostCalculator.calculate(llmProperties.getChatModel(), promptTokens, completionTokens);
 
             LlmUsageRecordDTO record = LlmUsageRecordDTO.builder()
                     .userId(userId)
@@ -415,7 +418,7 @@ public class AssistantService {
                     .latencyMs(latencyMs)
                     .success(success)
                     .errorMessage(errorMessage)
-                    .modelName(MODEL_NAME)
+                    .modelName(llmProperties.getChatModel())
                     .build();
 
             llmUsageCollector.record(record);

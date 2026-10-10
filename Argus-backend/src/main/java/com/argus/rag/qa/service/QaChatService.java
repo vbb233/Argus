@@ -52,8 +52,6 @@ public class QaChatService {
         /** 拒答原因描述：回答格式错误 */
         private static final String FORMAT_ERROR_MESSAGE = "模型返回格式错误，无法解析回答。";
 
-        private static final String MODEL_NAME = "qwen-plus";
-
         private final ChatClient qaChatClient;
         private final PromptTemplate qaUserPromptTemplate;
         private final ReadyChunkDocumentRetriever documentRetriever;

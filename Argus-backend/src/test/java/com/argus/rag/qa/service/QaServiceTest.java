@@ -5,6 +5,7 @@ import com.argus.rag.common.enums.SystemRole;
 import com.argus.rag.group.service.GroupMembershipService;
 import com.argus.rag.metrics.collector.LlmUsageCollector;
 import com.argus.rag.metrics.cost.LlmCostCalculator;
+import com.argus.rag.metrics.cost.LlmProperties;
 import com.argus.rag.qa.model.EvidenceLevel;
 import com.argus.rag.qa.model.dto.AskQuestionRequest;
 import com.argus.rag.qa.model.vo.AskQuestionResponse;
@@ -46,6 +47,12 @@ class QaServiceTest {
     @Mock
     private QaRecordPersistenceService qaRecordPersistenceService;
 
+    /**
+     * 使用真实实例而非 mock：其默认 chatModel 为 qwen-plus，
+     * 与下方 llmCostCalculator.calculate("qwen-plus", ...) 的桩保持一致。
+     */
+    private final LlmProperties llmProperties = new LlmProperties();
+
     @Test
     @DisplayName("同步问答应持久化记录并返回 recordId")
     void shouldPersistSyncAnswerAndReturnRecordId() {
@@ -55,7 +62,8 @@ class QaServiceTest {
                 currentUserService,
                 llmUsageCollector,
                 llmCostCalculator,
-                qaRecordPersistenceService
+                qaRecordPersistenceService,
+                llmProperties
         );
         AskQuestionRequest request = new AskQuestionRequest();
         request.setGroupId(1L);
@@ -104,7 +112,8 @@ class QaServiceTest {
                 currentUserService,
                 llmUsageCollector,
                 llmCostCalculator,
-                qaRecordPersistenceService
+                qaRecordPersistenceService,
+                llmProperties
         );
         AskQuestionRequest request = new AskQuestionRequest();
         request.setGroupId(1L);
