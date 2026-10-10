@@ -38,7 +38,16 @@ services:
       retries: 20
 
   minio:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    # ⚠️ 上游依赖变更（2026-09-11）：
+    #    MinIO 官方已于 2026-09-11 将 minio/minio 与 minio/mc 从 Docker Hub 整体移除，
+    #    全部 tag 失效（含本项目原本钉死的 RELEASE.2025-09-07T16-13-09Z）。
+    #    quay.io/minio/minio 亦不可用；社区版已转为 source-only 分发。
+    #    此处改用社区维护的镜像副本，软件本体相同（composeObject 等 MinIO 私有 API 依然可用）。
+    #
+    #    上游原值：image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    #
+    #    生产环境建议评估替代品（RustFS / SeaweedFS）或使用商业版 AIStor。
+    image: pgsty/minio:latest
     container_name: argus-rag-minio
     restart: unless-stopped
     command: server /data --console-address ":9001"
