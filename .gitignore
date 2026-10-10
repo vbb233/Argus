@@ -43,5 +43,16 @@ Thumbs.db
 .env.local
 .env.*.local
 
+# --- Docker Compose 环境变量文件 ---
+# ⚠️ 上面三条规则匹配不到 .env.server-a 这种命名，
+#    而 deploy/README.md 明确要求把 PostgreSQL 密码、MinIO 凭证、
+#    ARGUS_RAG_JWT_SECRET 写进该文件。不加下面这些规则，
+#    一次 git add . 就会把凭据提交到公开仓库。
+.env.server-a
+.env.server-b
+**/.env.server-a
+**/.env.server-b
+**/.env.server-*
+
 # --- Logs ---
 *.log
