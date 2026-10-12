@@ -56,6 +56,17 @@ public class HybridChunkRetrievalService {
     private static final int RRF_K = 0;
     /** 全局遍历时最大拉取的文档数量，防范上下文超长 */
     private static final int MAX_GLOBAL_DOCUMENTS = 50;
+    /**
+     * 全局遍历时单个文档最多注入的字符数。
+     * <p>防止单个超大文档挤占其他文档的预算。</p>
+     */
+    private static final int MAX_GLOBAL_CHARS_PER_DOCUMENT = 24000;
+    /**
+     * 全局遍历时所有文档合计最多注入的字符数。
+     * <p>聚合类问题（求和、计数、最值）需要看到足够多的完整切片，
+     * 但无上限地注入会让上下文与调用成本失控，故设总量上限。</p>
+     */
+    private static final int MAX_GLOBAL_CHARS_TOTAL = 120000;
 
     /** 向量检索适配器 */
     private final PgVectorRetrievalAdapter vectorRetrievalAdapter;
@@ -218,7 +229,16 @@ public class HybridChunkRetrievalService {
     }
 
     /**
-     * 执行全局遍历检索，提取群组内所有 READY 状态文档的首个切片。
+     * 执行全局遍历检索。
+     *
+     * <p>提取群组内所有 READY 状态文档的<b>全部切片</b>（按 chunkIndex 升序），
+     * 以便回答聚合类问题——例如"第 5 学期一共开设了多少门课""课程表里共列出多少门课"
+     * "所有课程总学分是多少"。这类问题必须看到表格的全部分行才能求和/计数，
+     * 只给每个文档的首个切片会漏掉正文后部（如培养方案第 9 页起的教学计划表）。</p>
+     *
+     * <p>为避免上下文与成本失控，注入量受两级预算约束：
+     * {@link #MAX_GLOBAL_CHARS_PER_DOCUMENT}（单文档）与
+     * {@link #MAX_GLOBAL_CHARS_TOTAL}（总量）。触顶会记录 WARN 日志。</p>
      */
     private RetrievedEvidenceBundle retrieveGlobal(Long groupId, String question) {
         List<DocumentEntity> docs = documentMapper.selectList(
@@ -237,55 +257,89 @@ public class HybridChunkRetrievalService {
 
         List<Document> documents = new ArrayList<>();
         int evidenceIndex = 1;
+        int totalChars = 0;
+        int truncatedDocuments = 0;
 
         for (DocumentEntity doc : docs) {
-            List<DocumentChunkEntity> activeChunks = documentChunkMapper.selectReadyActiveChunksByDocumentId(groupId, doc.getId());
-            if (activeChunks.isEmpty()) {
-                continue;
-            }
-            
-            DocumentChunkEntity primaryChunk = activeChunks.stream()
-                    .filter(c -> c.getChunkIndex() != null && c.getChunkIndex() == 0)
-                    .findFirst()
-                    .orElse(activeChunks.get(0));
-
-            if (primaryChunk == null || !StringUtils.hasText(primaryChunk.getChunkText())) {
+            if (totalChars >= MAX_GLOBAL_CHARS_TOTAL) {
+                truncatedDocuments++;
                 continue;
             }
 
-            Map<String, Object> metadata = new LinkedHashMap<>();
-            String evidenceId = "E" + evidenceIndex;
-            metadata.put("evidenceId", evidenceId);
-            metadata.put("groupId", groupId);
-            metadata.put("documentId", doc.getId());
-            metadata.put("chunkId", primaryChunk.getId());
-            metadata.put("chunkIndex", primaryChunk.getChunkIndex());
-            metadata.put("fileName", doc.getFileName());
-            metadata.put("score", 1.0D);
-            metadata.put("retrievalSource", "GLOBAL");
-            metadata.put("coverageMode", "GLOBAL_TRAVERSAL");
+            List<DocumentChunkEntity> activeChunks =
+                    documentChunkMapper.selectReadyActiveChunksByDocumentId(groupId, doc.getId());
+            if (activeChunks == null || activeChunks.isEmpty()) {
+                continue;
+            }
 
-            String evidenceText = "文件名：" + doc.getFileName() + "\n" + primaryChunk.getChunkText().trim();
+            // 明确按 chunkIndex 升序，不依赖底层查询的返回顺序
+            List<DocumentChunkEntity> orderedChunks = new ArrayList<>(activeChunks);
+            orderedChunks.sort(Comparator.comparingInt(
+                    c -> c.getChunkIndex() == null ? Integer.MAX_VALUE : c.getChunkIndex()));
 
-            documents.add(Document.builder()
-                    .id(evidenceId)
-                    .text(evidenceText)
-                    .metadata(metadata)
-                    .build());
-            
-            evidenceIndex++;
+            int docChars = 0;
+            boolean docTruncated = false;
+
+            for (DocumentChunkEntity chunk : orderedChunks) {
+                if (!StringUtils.hasText(chunk.getChunkText())) {
+                    continue;
+                }
+                String chunkText = chunk.getChunkText().trim();
+
+                if (docChars + chunkText.length() > MAX_GLOBAL_CHARS_PER_DOCUMENT
+                        || totalChars + chunkText.length() > MAX_GLOBAL_CHARS_TOTAL) {
+                    docTruncated = true;
+                    break;
+                }
+
+                Map<String, Object> metadata = new LinkedHashMap<>();
+                String evidenceId = "E" + evidenceIndex;
+                metadata.put("evidenceId", evidenceId);
+                metadata.put("groupId", groupId);
+                metadata.put("documentId", doc.getId());
+                metadata.put("chunkId", chunk.getId());
+                metadata.put("chunkIndex", chunk.getChunkIndex());
+                metadata.put("fileName", doc.getFileName());
+                metadata.put("score", 1.0D);
+                metadata.put("retrievalSource", "GLOBAL");
+                metadata.put("coverageMode", "GLOBAL_TRAVERSAL");
+
+                String evidenceText = "文件名：" + doc.getFileName() + "\n" + chunkText;
+
+                documents.add(Document.builder()
+                        .id(evidenceId)
+                        .text(evidenceText)
+                        .metadata(metadata)
+                        .build());
+
+                evidenceIndex++;
+                docChars += chunkText.length();
+                totalChars += chunkText.length();
+            }
+
+            if (docTruncated) {
+                truncatedDocuments++;
+                log.warn("全局遍历检索: 文档切片注入被预算截断, documentId={}, fileName={}, docChars={}",
+                        doc.getId(), doc.getFileName(), docChars);
+            }
         }
 
         if (documents.isEmpty()) {
             return RetrievedEvidenceBundle.empty();
         }
 
+        log.info("全局遍历检索: 文档数={}, 切片数={}, 累计字符={}, 被截断文档数={}",
+                docs.size(), documents.size(), totalChars, truncatedDocuments);
+
         EvidenceLevel evidenceLevel = EvidenceLevel.SUFFICIENT;
-        return new RetrievedEvidenceBundle(
-                documents, 
-                evidenceLevel, 
-                "当前为全局遍历模式，已列出所有可用文档的概览。请根据这些文档分别总结回答，仍然不得超出提供的信息进行臆测。"
-        );
+        String guidance = truncatedDocuments > 0
+                ? "当前为全局遍历模式，已注入知识库中全部文档的分片内容（部分超大文档因长度预算被截断）。"
+                  + "请基于这些完整内容作答；涉及求和、计数、最值时，请先逐条列出所依据的条目再给出结论，"
+                  + "仍不得超出提供的信息进行臆测；若证据明显不完整，请明确说明不确定。"
+                : "当前为全局遍历模式，已注入知识库中全部文档的全部分片内容。"
+                  + "请基于这些完整内容作答；涉及求和、计数、最值时，请先逐条列出所依据的条目再给出结论，"
+                  + "仍不得超出提供的信息进行臆测。";
+        return new RetrievedEvidenceBundle(documents, evidenceLevel, guidance);
     }
 
     /**
