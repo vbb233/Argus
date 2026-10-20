@@ -16,10 +16,16 @@ import java.io.InputStream;
  * <h3>解析策略</h3>
  * <ol>
  *     <li>使用 PDFBox 的 {@link PDDocument#load(InputStream)} 加载 PDF 文档</li>
- *     <li>通过 {@link PDFTextStripper} 提取全部文本内容（按页码顺序）</li>
+ *     <li>通过 {@link LayoutAwarePdfTextStripper} 提取全部文本内容（按页码顺序）</li>
  *     <li>统一换行符：将所有 {@code \r\n} 和独立的 {@code \r} 转换为 {@code \n}</li>
  *     <li>去除首尾空白字符</li>
  * </ol>
+ *
+ * <h3>为什么不用默认的 {@link PDFTextStripper}</h3>
+ * <p>默认提取器按 (y, x) 顺序线性输出，会把<b>竖排表头</b>逐字打散成
+ * {@code 课 / 程 / 类 / 别 / 授 / 课 / 学 / 期} 这样的碎片，使表格列语义彻底丢失
+ * （详见 {@link LayoutAwarePdfTextStripper} 的类注释）。因此这里改用版面感知实现：
+ * 它在默认行切分的基础上只修复竖排片段，其余文本保持原样。</p>
  *
  * <h3>异常处理</h3>
  * <p>PDFBox 在遇到损坏文件、加密文件或非 PDF 格式时可能抛出多种异常
@@ -45,8 +51,8 @@ public class PdfDocumentParser implements DocumentParser {
     /**
      * 解析 PDF 文件内容为纯文本。
      *
-     * <p>使用 PDFBox 加载 PDF 文档并通过文本剥离器提取全部文本。
-     * 解析完成后会自动关闭 PDF 文档资源。</p>
+     * <p>使用 PDFBox 加载 PDF 文档，并通过 {@link LayoutAwarePdfTextStripper}
+     * 提取文本（含竖排表头修复）。解析完成后会自动关闭 PDF 文档资源。</p>
      *
      * @param inputStream PDF 文件的输入流
      * @return 解析后的纯文本内容
@@ -56,7 +62,7 @@ public class PdfDocumentParser implements DocumentParser {
     @Override
     public String parse(InputStream inputStream) {
         try (PDDocument document = PDDocument.load(inputStream)) {
-            String text = new PDFTextStripper().getText(document);
+            String text = new LayoutAwarePdfTextStripper().getLayoutText(document);
             return text.replace("\r\n", "\n").replace('\r', '\n').trim();
         } catch (IOException exception) {
             throw new BusinessException("PDF 文档解析失败", exception);

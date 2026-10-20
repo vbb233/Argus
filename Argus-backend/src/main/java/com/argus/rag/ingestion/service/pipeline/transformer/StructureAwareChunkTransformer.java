@@ -27,6 +27,18 @@ public class StructureAwareChunkTransformer implements DocumentTransformer {
     private static final Pattern HEADING = Pattern.compile("(?m)^(#{1,6})\\s+(.+)$");
     /** 每 token 估算字符数（简化为 1:1） */
     private static final int CHARS_PER_TOKEN = 1;
+    /** 常见表头列名关键字，用于识别表格表头行 */
+    private static final Pattern TABLE_HEADER_KEYWORDS = Pattern.compile(
+            "序号|编号|代码|课程号|课程名|名称|学期|学时|学分|数量|单价|金额|日期|时间"
+                    + "|比例|占比|备注|说明|类型|类别|项目|内容|单位|合计|小计|成绩|分数|等级|状态");
+    /** 纯数字单元格 */
+    private static final Pattern NUMERIC_TOKEN = Pattern.compile("\\d+(?:\\.\\d+)?");
+    /** 回填表头时加在分块开头的标记 */
+    private static final String HEADER_PREFIX = "[表格表头] ";
+    /** 向前查找表头的最大字符距离 */
+    private static final int HEADER_LOOKBACK_CHARS = 20000;
+    /** 分块至少含多少条数据行才认为它依赖表头 */
+    private static final int MIN_DATA_ROWS_FOR_HEADER = 2;
     private final ChunkingProperties properties;
 
     /**
@@ -236,11 +248,131 @@ public class StructureAwareChunkTransformer implements DocumentTransformer {
         metadata.put("charEnd", range.end());
         metadata.put("chunkStrategy", STRATEGY);
         String id = source.getId() == null ? null : source.getId() + ":" + chunkIndex;
+        String body = source.getText().substring(range.start(), range.end());
         return Document.builder()
                 .id(id)
-                .text(source.getText().substring(range.start(), range.end()))
+                .text(withTableHeader(source.getText(), range.start(), body))
                 .metadata(metadata)
                 .build();
+    }
+
+    /**
+     * 为表格数据分块回填其所属表格的表头。
+     *
+     * <h3>为什么需要</h3>
+     * <p>PDF 抽取后的表格是「表头一行 + 若干数据行」，切片后表头往往只落在某一个分块里，
+     * 其余分块只剩 {@code 1960813 团队激励与沟通 5 2 1 24 12 12} 这样的裸数据行。
+     * 缺少表头时分块<b>失去列语义</b>：模型无法判断第一列是「授课学期」还是别的度量，
+     * 只能拒答。<b>「学分」列尚可借助 {@code 24 = 12 + 12} 这类算术关系反推，
+     * 「授课学期」列没有任何交叉校验可用</b>，因此这类问题几乎必然失败。</p>
+     *
+     * <h3>做法</h3>
+     * <p>若分块含 {@value #MIN_DATA_ROWS_FOR_HEADER} 条以上数据行，且自身不含表头，
+     * 则从原文向前回溯最近的一条表头行，以 {@code [表格表头] } 前缀注入分块开头。
+     * 前缀标记保证下游能区分「回填内容」与「原文内容」。
+     * 由于中文表格通常在每页重复表头，最近的一条表头就是本分块所属表格的表头。</p>
+     *
+     * @param fullText 文档全文
+     * @param offset   本分块在全文中的起始位置
+     * @param body     本分块原文
+     * @return 可能已注入表头的分块文本
+     */
+    private String withTableHeader(String fullText, int offset, String body) {
+        if (countDataRows(body) < MIN_DATA_ROWS_FOR_HEADER) {
+            return body;
+        }
+        String header = findTableHeaderBefore(fullText, offset);
+        if (header == null || body.contains(header)) {
+            return body;
+        }
+        return HEADER_PREFIX + header + "\n" + body;
+    }
+
+    /**
+     * 统计文本中的表格数据行数量。
+     *
+     * <p>数据行的判定：一行内至少 3 个纯数字单元格。这能覆盖
+     * {@code 2490013 中国近现代史纲要 2 3 3 48 42 6} 这类记录行，
+     * 而普通叙述性文字极少出现连续 3 个数值。</p>
+     *
+     * @param text 分块文本
+     * @return 数据行条数
+     */
+    private int countDataRows(String text) {
+        int rows = 0;
+        for (String line : text.split("\n")) {
+            if (isTableDataRow(line)) {
+                rows++;
+            }
+        }
+        return rows;
+    }
+
+    // 判断一行是否为表格数据行：至少 3 个纯数字单元格
+    private boolean isTableDataRow(String line) {
+        String trimmed = line.strip();
+        if (trimmed.isEmpty()) {
+            return false;
+        }
+        int numeric = 0;
+        for (String token : trimmed.split("\\s+")) {
+            if (NUMERIC_TOKEN.matcher(token).matches()) {
+                numeric++;
+            }
+        }
+        return numeric >= 3;
+    }
+
+    /**
+     * 从指定位置向前回溯，找到最近的一条表格表头行。
+     *
+     * @param fullText 文档全文
+     * @param offset   回溯起点
+     * @return 表头行文本；找不到时返回 {@code null}
+     */
+    private String findTableHeaderBefore(String fullText, int offset) {
+        int from = Math.max(0, offset - HEADER_LOOKBACK_CHARS);
+        if (from >= offset) {
+            return null;
+        }
+        String[] lines = fullText.substring(from, offset).split("\n");
+        for (int index = lines.length - 1; index >= 0; index--) {
+            if (isTableHeaderLine(lines[index])) {
+                return lines[index].strip();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 判断一行是否为表格表头行。
+     *
+     * <p>判据：按空白与 {@code |} 切分后至少 3 个单元格，其中至少 3 个命中表头列名关键字，
+     * 且关键字单元格占比不低于 60%。同时排除以句末标点结尾的叙述性文字。</p>
+     *
+     * @param line 待判定的一行
+     * @return 是表头行则返回 {@code true}
+     */
+    private boolean isTableHeaderLine(String line) {
+        String trimmed = line.strip();
+        if (trimmed.isEmpty() || trimmed.length() > 200) {
+            return false;
+        }
+        if (trimmed.endsWith("。") || trimmed.endsWith("；") || trimmed.endsWith("，")
+                || trimmed.endsWith("：")) {
+            return false;
+        }
+        String[] cells = trimmed.split("[\\s|　]+");
+        if (cells.length < 3) {
+            return false;
+        }
+        int matched = 0;
+        for (String cell : cells) {
+            if (TABLE_HEADER_KEYWORDS.matcher(cell).find()) {
+                matched++;
+            }
+        }
+        return matched >= 3 && matched * 100 >= cells.length * 60;
     }
 
     // 计算重叠起始位置，不低于章节起始位置
