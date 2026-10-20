@@ -16,6 +16,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
@@ -50,6 +51,31 @@ public class QueryPlanningService {
                     + "|一共|总共|共计"
                     + "|所有的?课程|全部课程"
                     + "|各学期|每个学期|每学期");
+
+    /**
+     * 提问用语 → 文档列名的词汇映射，用于<b>检索查询蒸馏</b>（不进入生成提示词）。
+     *
+     * <p>表格的列名是文档自己的措辞（「授课学期」），而用户自然会说
+     * 「在第几学期开课」。两者词面完全不重叠，关键词检索于是只能靠课程名
+     * 这类高词频词排序，大段叙述文字反而胜出。</p>
+     *
+     * <p>实测（同一份培养方案、同一个问题「软件工程在第几学期开课？」，
+     * 目标分块为含该课程行的行级分块）：</p>
+     * <pre>
+     *   "软件工程在第几学期开课"           -> 目标分块排第 10 位（进不了 top-5）
+     *   "软件工程在第几学期开课 授课学期"  -> 排第  7 位（只加词没用）
+     *   "软件工程 授课学期"               -> 排第  2 位  ← 蒸馏后才有效
+     * </pre>
+     *
+     * <p><b>为什么"加词"无效而"蒸馏"有效</b>：长查询里的
+     * 「在 / 第 / 几 / 学期 / 开课」这些通用词在大段叙述文中反复出现，
+     * 把目标分块压了下去；只有把查询压缩成「实体 + 列名」，
+     * 词密度才回到目标分块这一侧。</p>
+     */
+    private static final List<Map.Entry<Pattern, String>> TABLE_LOOKUPS = List.of(
+            Map.entry(Pattern.compile("^\\s*(.+?)\\s*在?第几(?:个)?学期"), "授课学期"),
+            Map.entry(Pattern.compile("^\\s*(.+?)\\s*(?:是|有)?(?:几|多少)个?学分"), "学分"),
+            Map.entry(Pattern.compile("^\\s*(.+?)\\s*(?:是|有)?(?:几|多少)个?学时"), "学时"));
 
     private final ChatClient queryPlanningChatClient;
     private final PromptTemplate queryPlanningUserPromptTemplate;
@@ -93,12 +119,81 @@ public class QueryPlanningService {
                     .call()
                     .entity(QueryPlanResult.class);
             QueryPlanResult validatedPlan = validatePlan(rawResult, normalizedQuestion);
-            log.info("查询规划完成: strategy={}, queries={}", validatedPlan.strategy(), validatedPlan.queries());
-            return validatedPlan;
+            QueryPlanResult retrievalPlan = expandForRetrieval(validatedPlan, normalizedQuestion);
+            log.info("查询规划完成: strategy={}, queries={}",
+                    retrievalPlan.strategy(), retrievalPlan.queries());
+            return retrievalPlan;
         } catch (RuntimeException exception) {
             log.warn("查询规划失败，回退为直接检索: question={}", normalizedQuestion, exception);
-            return QueryPlanResult.fallback(normalizedQuestion);
+            return expandForRetrieval(QueryPlanResult.fallback(normalizedQuestion), normalizedQuestion);
         }
+    }
+
+    /**
+     * 把「实体 + 口语化属性问法」的问题蒸馏成「实体 + 文档列名」的检索查询。
+     *
+     * <p>例如「软件工程在第几学期开课？」蒸馏为 {@code 软件工程 授课学期}。
+     * 仅在能明确抽出实体时生效；抽出结果不像实体（过长、含指示代词）时返回
+     * {@code null}，保持原有检索行为不变。</p>
+     *
+     * @param question 用户问题
+     * @return 蒸馏后的查询；无法蒸馏时返回 {@code null}
+     */
+    static String distilledTableQuery(String question) {
+        if (question == null) {
+            return null;
+        }
+        for (Map.Entry<Pattern, String> entry : TABLE_LOOKUPS) {
+            Matcher matcher = entry.getKey().matcher(question);
+            if (!matcher.find()) {
+                continue;
+            }
+            String entity = matcher.group(1).strip();
+            if (!looksLikeEntity(entity)) {
+                return null;
+            }
+            return entity + " " + entry.getValue();
+        }
+        return null;
+    }
+
+    // 判断抽出的片段是否像一个具体实体名（课程名等）
+    private static boolean looksLikeEntity(String candidate) {
+        if (candidate.length() < 2 || candidate.length() > 24) {
+            return false;
+        }
+        return !candidate.contains("这门") && !candidate.contains("那门")
+                && !candidate.contains("该课程") && !candidate.contains("这个")
+                && !candidate.contains("它");
+    }
+
+    /**
+     * 为检索追加一路「蒸馏查询」。
+     *
+     * <p>只影响 {@link QueryPlanResult#queries()}，即检索用查询；生成答案时使用的是
+     * 用户原始问题，不会被污染。原始查询保留，蒸馏查询作为<b>额外一路</b>参与融合，
+     * 因此不会削弱原有召回。</p>
+     *
+     * <p>{@code GLOBAL} 策略不按查询文本检索（直接遍历全部切片），跳过。</p>
+     *
+     * @param plan     规划结果
+     * @param question 用户问题
+     * @return 可能追加了蒸馏查询的规划结果
+     */
+    private QueryPlanResult expandForRetrieval(QueryPlanResult plan, String question) {
+        if (plan.strategy() == QueryPlanStrategy.GLOBAL) {
+            return plan;
+        }
+        String distilled = distilledTableQuery(question);
+        if (distilled == null) {
+            return plan;
+        }
+        LinkedHashSet<String> queries = new LinkedHashSet<>(plan.queries());
+        if (!queries.add(distilled)) {
+            return plan;
+        }
+        log.info("检索查询蒸馏: {} -> {}", question, distilled);
+        return new QueryPlanResult(plan.strategy(), List.copyOf(queries));
     }
 
     /**
