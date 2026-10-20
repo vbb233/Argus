@@ -21,6 +21,8 @@ import java.util.regex.Pattern;
 public class StructureAwareChunkTransformer implements DocumentTransformer {
     /** 分块策略标识，写入分块元数据 */
     private static final String STRATEGY = "structure-aware-token-budget-v1";
+    /** 行级分块的策略标识 */
+    private static final String ROW_STRATEGY = "table-row-v1";
     /** 匹配连续空行，用于段落拆分 */
     private static final Pattern BLANK_LINES = Pattern.compile("\\n\\s*\\n+");
     /** 匹配 Markdown ATX 标题行 */
@@ -77,7 +79,80 @@ public class StructureAwareChunkTransformer implements DocumentTransformer {
         List<ChunkRange> ranges = splitBySections(text).stream()
                 .flatMap(section -> splitSection(text, section).stream())
                 .toList();
-        return buildDocuments(document, ranges);
+        List<Document> chunks = new ArrayList<>(buildDocuments(document, ranges));
+        chunks.addAll(buildRowDocuments(document, chunks.size()));
+        return chunks;
+    }
+
+    /**
+     * 为表格数据行额外生成「行级分块」。
+     *
+     * <h3>为什么需要</h3>
+     * <p>一张课程表被切成几百字的混合分块后，单行数据的<b>词密度极低</b>：
+     * 一个分块里可能有 10 行课程，目标行只占 1/10。检索时这类分块很容易被
+     * 大段叙述文字挤出候选集。</p>
+     *
+     * <p>实测证据（同一份培养方案）：问题「软件工程在第几学期开课？」的关键词通道
+     * 召回前 12 名全是「软件工程专业」的叙述段落，而含目标行的分块排在第 13 位、
+     * 从未进入融合后的 top-5。根因是提问用语（「在第几学期开课」）与文档用语
+     * （列名「授课学期」）不匹配，检索只能靠「软件工程」这个高词频词排序，
+     * 于是大段叙述文胜出。</p>
+     *
+     * <h3>做法</h3>
+     * <p>为每条数据行单独生成一个分块，内容为「表名 + 表头 + 该行」。
+     * 这样课程名与列名在同一个<b>很短</b>的分块内同时出现，词密度与语义聚焦度都高，
+     * 检索可以精确命中。</p>
+     *
+     * <p>行级分块是<b>追加</b>的，不替换原有分块 —— 原有分块的索引与内容保持不变，
+     * 避免影响其他类型的提问。</p>
+     *
+     * @param source     源文档
+     * @param startIndex 已生成分块的数量，作为行级分块的索引起点
+     * @return 行级分块列表
+     */
+    private List<Document> buildRowDocuments(Document source, int startIndex) {
+        if (!properties.isTableRowChunks()) {
+            return List.of();
+        }
+        String text = source.getText();
+        List<Document> rows = new ArrayList<>();
+        String title = null;
+        String header = null;
+        int offset = 0;
+        for (String rawLine : text.split("\n", -1)) {
+            String line = rawLine.strip();
+            if (isTableTitleLine(line)) {
+                title = line;
+            } else if (isTableHeaderLine(line)) {
+                header = line;
+            } else if (header != null && isTableDataRow(line)
+                    && rows.size() < properties.getMaxTableRowChunks()) {
+                rows.add(buildRowDocument(source, title, header, line, startIndex + rows.size(), offset));
+            }
+            offset += rawLine.length() + 1;
+        }
+        return rows;
+    }
+
+    // 构建单条行级分块
+    private Document buildRowDocument(Document source, String title, String header,
+                                      String row, int chunkIndex, int charStart) {
+        StringBuilder text = new StringBuilder();
+        if (title != null) {
+            text.append(TITLE_PREFIX).append(title).append('\n');
+        }
+        text.append(HEADER_PREFIX).append(header).append('\n').append(row);
+
+        Map<String, Object> metadata = new LinkedHashMap<>();
+        if (source.getMetadata() != null) {
+            metadata.putAll(source.getMetadata());
+        }
+        metadata.put("sectionPath", title == null ? "" : title);
+        metadata.put("charStart", charStart);
+        metadata.put("charEnd", charStart + row.length());
+        metadata.put("chunkStrategy", ROW_STRATEGY);
+        String id = source.getId() == null ? null : source.getId() + ":" + chunkIndex;
+        return Document.builder().id(id).text(text.toString()).metadata(metadata).build();
     }
 
     // 收集标题并将文本按标题边界拆分为章节列表

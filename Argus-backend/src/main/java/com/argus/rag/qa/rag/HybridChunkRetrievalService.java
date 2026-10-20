@@ -68,6 +68,15 @@ public class HybridChunkRetrievalService {
      */
     private static final int MAX_GLOBAL_CHARS_TOTAL = 120000;
 
+    /**
+     * 行级分块在元数据中的策略标识片段。
+     *
+     * <p>行级分块（{@code table-row-v1}）是为精确命中而在常规分块之外<b>追加</b>的，
+     * 内容与常规分块中的表格行重复。GLOBAL 遍历必须跳过它们，否则同一行注入两次，
+     * 并且字符预算会提前触顶。</p>
+     */
+    private static final String TABLE_ROW_STRATEGY_MARKER = "table-row-v1";
+
     /** 向量检索适配器 */
     private final PgVectorRetrievalAdapter vectorRetrievalAdapter;
     /** Elasticsearch 关键词检索服务 */
@@ -240,6 +249,20 @@ public class HybridChunkRetrievalService {
      * {@link #MAX_GLOBAL_CHARS_PER_DOCUMENT}（单文档）与
      * {@link #MAX_GLOBAL_CHARS_TOTAL}（总量）。触顶会记录 WARN 日志。</p>
      */
+    /**
+     * 判断某个分块是否为「行级分块」（{@code table-row-v1}）。
+     *
+     * <p>行级分块是常规分块中表格行的同内容副本，只服务精确命中，
+     * 全量遍历时应跳过以免重复注入。</p>
+     *
+     * @param chunk 分块实体
+     * @return 是行级分块时返回 {@code true}
+     */
+    private boolean isTableRowChunk(DocumentChunkEntity chunk) {
+        String metadata = chunk.getMetadataJson();
+        return metadata != null && metadata.contains(TABLE_ROW_STRATEGY_MARKER);
+    }
+
     private RetrievedEvidenceBundle retrieveGlobal(Long groupId, String question) {
         List<DocumentEntity> docs = documentMapper.selectList(
                 new LambdaQueryWrapper<DocumentEntity>()
@@ -282,6 +305,13 @@ public class HybridChunkRetrievalService {
 
             for (DocumentChunkEntity chunk : orderedChunks) {
                 if (!StringUtils.hasText(chunk.getChunkText())) {
+                    continue;
+                }
+                // 行级分块是常规分块中表格行的「同内容副本」，仅用于精确命中。
+                // GLOBAL 遍历若把它们也算进去，同一行会被注入两次、并且让字符预算
+                // 提前触顶（实测文档内容会从约 8.5K 字膨胀到约 27K 字，
+                // 超过单文档 24000 字符预算，导致表格尾部被截断）。
+                if (isTableRowChunk(chunk)) {
                     continue;
                 }
                 String chunkText = chunk.getChunkText().trim();

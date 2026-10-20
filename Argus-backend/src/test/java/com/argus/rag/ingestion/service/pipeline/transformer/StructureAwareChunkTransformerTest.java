@@ -23,6 +23,7 @@ class StructureAwareChunkTransformerTest {
     private static final String TITLE = "软件工程专业课程设置表";
     private static final String HEADER = "课程类别 | 修读类别 | 课程号 | 课程名称 | 授课学期 "
             + "| 周学时 | 学分 | 总学时 | 授课学时 | 实验学时 | 上机学时 | 备注";
+    private static final String ROW_STRATEGY = "table-row-v1";
 
     private final StructureAwareChunkTransformer transformer =
             new StructureAwareChunkTransformer(new ChunkingProperties(200, 320, 32));
@@ -106,5 +107,77 @@ class StructureAwareChunkTransformerTest {
         assertThat(texts.stream().collect(Collectors.joining("\n")))
                 .contains("测试课程1")
                 .contains("测试课程20");
+    }
+
+    @Test
+    @DisplayName("应为每条表格数据行生成独立的行级分块")
+    void shouldEmitOneRowChunkPerDataRow() {
+        List<Document> chunks = chunkTableDocument();
+
+        List<Document> rowChunks = chunks.stream()
+                .filter(doc -> ROW_STRATEGY.equals(doc.getMetadata().get("chunkStrategy")))
+                .toList();
+
+        assertThat(rowChunks).as("40 条数据行应各生成一个行级分块").hasSize(40);
+    }
+
+    @Test
+    @DisplayName("行级分块应只含表名、表头与单行数据")
+    void rowChunkShouldContainExactlyOneRow() {
+        Document rowChunk = chunkTableDocument().stream()
+                .filter(doc -> ROW_STRATEGY.equals(doc.getMetadata().get("chunkStrategy")))
+                .findFirst()
+                .orElseThrow();
+
+        String text = rowChunk.getText();
+        assertThat(text).startsWith("[所属表格] " + TITLE);
+        assertThat(text).contains("[表格表头] ");
+
+        long dataRows = text.lines()
+                .map(String::strip)
+                .filter(line -> line.matches("^\\d{7}\\s+.*"))
+                .count();
+        assertThat(dataRows).as("行级分块内应只有一条数据行").isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("行级分块应追加在原有分块之后，不打乱原分块索引")
+    void rowChunksShouldBeAppendedAfterRegularChunks() {
+        List<Document> chunks = chunkTableDocument();
+
+        int firstRowChunkIndex = -1;
+        for (int i = 0; i < chunks.size(); i++) {
+            if (ROW_STRATEGY.equals(chunks.get(i).getMetadata().get("chunkStrategy"))) {
+                firstRowChunkIndex = i;
+                break;
+            }
+        }
+        assertThat(firstRowChunkIndex).isPositive();
+
+        for (int i = firstRowChunkIndex; i < chunks.size(); i++) {
+            assertThat(chunks.get(i).getMetadata().get("chunkStrategy"))
+                    .as("行级分块之后不应再出现普通分块")
+                    .isEqualTo(ROW_STRATEGY);
+        }
+    }
+
+    @Test
+    @DisplayName("关闭开关后不应生成行级分块")
+    void shouldNotEmitRowChunksWhenDisabled() {
+        ChunkingProperties disabled = new ChunkingProperties(200, 320, 32);
+        disabled.setTableRowChunks(false);
+        StructureAwareChunkTransformer noRows = new StructureAwareChunkTransformer(disabled);
+
+        StringBuilder text = new StringBuilder();
+        text.append(TITLE).append('\n').append(HEADER).append('\n');
+        for (int i = 0; i < 5; i++) {
+            text.append(String.format("196%04d 测试课程%d 1 2 2 32 20 12%n", i, i));
+        }
+        List<Document> chunks = noRows.apply(
+                List.of(new Document("doc-3", text.toString(), Map.of())));
+
+        assertThat(chunks).isNotEmpty();
+        assertThat(chunks).allSatisfy(doc ->
+                assertThat(doc.getMetadata().get("chunkStrategy")).isNotEqualTo(ROW_STRATEGY));
     }
 }
