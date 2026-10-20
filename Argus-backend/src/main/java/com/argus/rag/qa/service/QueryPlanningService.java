@@ -16,6 +16,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 /**
  * 查询规划服务。
@@ -31,6 +32,24 @@ public class QueryPlanningService {
 
     /** 检索语句最大数量限制 */
     private static final int MAX_QUERY_COUNT = 3;
+
+    /**
+     * 需要「整篇文档覆盖」才能回答的问题特征：计数、枚举、跨条目汇总。
+     *
+     * <p>这类问题的答案<b>不出现在任何单个切片里</b> —— 例如
+     * 「第5学期一共开设了多少门课程？」必须把散布在多个切片中的全部课程行
+     * 汇总后才能计数。若交给相关度检索，只会拿到 4~5 个切片，
+     * 模型据此计数必然少数（实测答「5 项」，实际 8 项）。</p>
+     *
+     * <p>提示词已要求模型在遇到这类问题时选择 {@code GLOBAL}，但实测选择并不稳定。
+     * 因此这里加一条<b>确定性兜底</b>：命中即强制走 {@code GLOBAL}，
+     * 不再依赖大模型判断。</p>
+     */
+    private static final Pattern FULL_COVERAGE_QUESTION = Pattern.compile(
+            "多少门|几门|哪几门|哪些课"
+                    + "|一共|总共|共计"
+                    + "|所有的?课程|全部课程"
+                    + "|各学期|每个学期|每学期");
 
     private final ChatClient queryPlanningChatClient;
     private final PromptTemplate queryPlanningUserPromptTemplate;
@@ -61,6 +80,10 @@ public class QueryPlanningService {
      */
     public QueryPlanResult plan(String question) {
         String normalizedQuestion = requireQuestion(question);
+        if (requiresFullCoverage(normalizedQuestion)) {
+            log.info("查询规划: 命中全量覆盖规则, 强制 GLOBAL, question={}", normalizedQuestion);
+            return new QueryPlanResult(QueryPlanStrategy.GLOBAL, List.of(normalizedQuestion));
+        }
         try {
 
             Prompt planPrompt = queryPlanningUserPromptTemplate.create(Map.of("question", normalizedQuestion));
@@ -105,9 +128,20 @@ public class QueryPlanningService {
         return new QueryPlanResult(rawResult.strategy(), finalQueries);
     }
 
+    /**
+     * 判断问题是否必须遍历整篇文档才能回答（计数 / 枚举 / 跨条目汇总）。
+     *
+     * <p>可见性为包级，便于在不启动 Spring 上下文的情况下直接单测这条规则。</p>
+     *
+     * @param question 用户问题
+     * @return 需要全量覆盖时返回 {@code true}
+     */
+    static boolean requiresFullCoverage(String question) {
+        return question != null && FULL_COVERAGE_QUESTION.matcher(question).find();
+    }
+
     /** 构建 REWRITE 策略的检索语句：原始问题 + 重写后的语句 */
-    private List<String> buildRewriteQueries(String originalQuestion, Set<String> normalizedQueries) {
-        LinkedHashSet<String> rewriteQueries = new LinkedHashSet<>();
+    private List<String> buildRewriteQueries(String originalQuestion, Set<String> normalizedQueries) {        LinkedHashSet<String> rewriteQueries = new LinkedHashSet<>();
         rewriteQueries.add(originalQuestion);
         rewriteQueries.addAll(normalizedQueries);
         return limitQueries(rewriteQueries);
