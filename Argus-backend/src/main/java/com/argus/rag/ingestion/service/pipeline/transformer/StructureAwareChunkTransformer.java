@@ -35,6 +35,10 @@ public class StructureAwareChunkTransformer implements DocumentTransformer {
     private static final Pattern NUMERIC_TOKEN = Pattern.compile("\\d+(?:\\.\\d+)?");
     /** 回填表头时加在分块开头的标记 */
     private static final String HEADER_PREFIX = "[表格表头] ";
+    /** 回填表名时加在分块开头的标记 */
+    private static final String TITLE_PREFIX = "[所属表格] ";
+    /** 表格标题行的最大长度 */
+    private static final int MAX_TABLE_TITLE_LENGTH = 48;
     /** 向前查找表头的最大字符距离 */
     private static final int HEADER_LOOKBACK_CHARS = 20000;
     /** 分块至少含多少条数据行才认为它依赖表头 */
@@ -251,41 +255,95 @@ public class StructureAwareChunkTransformer implements DocumentTransformer {
         String body = source.getText().substring(range.start(), range.end());
         return Document.builder()
                 .id(id)
-                .text(withTableHeader(source.getText(), range.start(), body))
+                .text(withTableContext(source.getText(), range.start(), body))
                 .metadata(metadata)
                 .build();
     }
 
     /**
-     * 为表格数据分块回填其所属表格的表头。
+     * 为表格数据分块回填其所属表格的表名与表头。
      *
-     * <h3>为什么需要</h3>
+     * <h3>为什么需要（表头）</h3>
      * <p>PDF 抽取后的表格是「表头一行 + 若干数据行」，切片后表头往往只落在某一个分块里，
      * 其余分块只剩 {@code 1960813 团队激励与沟通 5 2 1 24 12 12} 这样的裸数据行。
      * 缺少表头时分块<b>失去列语义</b>：模型无法判断第一列是「授课学期」还是别的度量，
      * 只能拒答。<b>「学分」列尚可借助 {@code 24 = 12 + 12} 这类算术关系反推，
      * 「授课学期」列没有任何交叉校验可用</b>，因此这类问题几乎必然失败。</p>
      *
+     * <h3>为什么需要（表名）</h3>
+     * <p>数据行分块里往往只有数字和课程名，缺少「这是一张什么表」的语义锚点。
+     * 典型受害场景：课程名恰好与专业名重名。例如 {@code 软件工程} 这门课的数据行
+     * 只出现在一个分块里，而「软件工程」作为<b>专业名</b>出现在十几个分块中，
+     * 检索因而被专业名主导，命中「专业主干课程：软件工程（48学时）」而不是课程表行。
+     * 注入表名（如 {@code 软件工程专业课程设置表}）后，分块才带有表格级语义。</p>
+     *
      * <h3>做法</h3>
-     * <p>若分块含 {@value #MIN_DATA_ROWS_FOR_HEADER} 条以上数据行，且自身不含表头，
-     * 则从原文向前回溯最近的一条表头行，以 {@code [表格表头] } 前缀注入分块开头。
+     * <p>若分块含 {@value #MIN_DATA_ROWS_FOR_HEADER} 条以上数据行，
+     * 则从原文向前回溯最近的表名行与表头行，以
+     * {@code [所属表格] ...} 与 {@code [表格表头] ...} 前缀注入分块开头。
      * 前缀标记保证下游能区分「回填内容」与「原文内容」。
      * 由于中文表格通常在每页重复表头，最近的一条表头就是本分块所属表格的表头。</p>
      *
      * @param fullText 文档全文
      * @param offset   本分块在全文中的起始位置
      * @param body     本分块原文
-     * @return 可能已注入表头的分块文本
+     * @return 可能已注入表名与表头的分块文本
      */
-    private String withTableHeader(String fullText, int offset, String body) {
+    private String withTableContext(String fullText, int offset, String body) {
         if (countDataRows(body) < MIN_DATA_ROWS_FOR_HEADER) {
             return body;
         }
-        String header = findTableHeaderBefore(fullText, offset);
-        if (header == null || body.contains(header)) {
-            return body;
+        StringBuilder prefix = new StringBuilder();
+        String title = findTableTitleBefore(fullText, offset);
+        if (title != null && !body.contains(title)) {
+            prefix.append(TITLE_PREFIX).append(title).append('\n');
         }
-        return HEADER_PREFIX + header + "\n" + body;
+        String header = findTableHeaderBefore(fullText, offset);
+        if (header != null && !body.contains(header)) {
+            prefix.append(HEADER_PREFIX).append(header).append('\n');
+        }
+        return prefix.isEmpty() ? body : prefix.append(body).toString();
+    }
+
+    /**
+     * 从指定位置向前回溯，找到最近的表格标题行。
+     *
+     * <p>标题行的判据：较短、以「表」或「矩阵」结尾、不包含连续数值。
+     * 例如 {@code 软件工程专业课程设置表}、
+     * {@code 软件工程专业各学期必修课程学分分布情况表}。</p>
+     *
+     * @param fullText 文档全文
+     * @param offset   回溯起点
+     * @return 标题行文本；找不到时返回 {@code null}
+     */
+    private String findTableTitleBefore(String fullText, int offset) {
+        int from = Math.max(0, offset - HEADER_LOOKBACK_CHARS);
+        if (from >= offset) {
+            return null;
+        }
+        String[] lines = fullText.substring(from, offset).split("\n");
+        for (int index = lines.length - 1; index >= 0; index--) {
+            if (isTableTitleLine(lines[index])) {
+                return lines[index].strip();
+            }
+        }
+        return null;
+    }
+
+    // 判断一行是否为表格标题行
+    private boolean isTableTitleLine(String line) {
+        String trimmed = line.strip();
+        if (trimmed.isEmpty() || trimmed.length() > MAX_TABLE_TITLE_LENGTH) {
+            return false;
+        }
+        if (!trimmed.endsWith("表") && !trimmed.endsWith("矩阵")) {
+            return false;
+        }
+        if (trimmed.endsWith("。") || trimmed.endsWith("；")) {
+            return false;
+        }
+        // 标题不应包含连续数值（那是数据行或表头的特征）
+        return !NUMERIC_TOKEN.matcher(trimmed).find();
     }
 
     /**
