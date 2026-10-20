@@ -118,4 +118,28 @@
             #{chunkId}
         </foreach>
     </select>
+
+    <!--
+      实体级检索通道：按表格行的名称精确查行级分块。
+      行级分块在入库时把表格行的名称写入 metadata_json.rowName，因此可以精确匹配，
+      避免「软件工程」这类既是课程名、又出现在表名里的词命中大量无关分块。
+    -->
+    <select id="selectRowChunksByRowName" resultType="map">
+        select chunks.group_id as groupId,
+               chunks.id as chunkId,
+               chunks.document_id as documentId,
+               chunks.chunk_index as chunkIndex,
+               chunks.chunk_text as chunkText,
+               documents.file_name as fileName
+        from document_chunks chunks
+                 join documents documents
+                      on documents.id = chunks.document_id
+                          and documents.group_id = chunks.group_id
+        where chunks.group_id = #{groupId}
+          and documents.status = 'READY'
+          and documents.deleted = false
+          and chunks.metadata_json ->> 'rowName' = #{rowName}
+        order by chunks.chunk_index asc, chunks.id asc
+        limit #{limit}
+    </select>
 </mapper>

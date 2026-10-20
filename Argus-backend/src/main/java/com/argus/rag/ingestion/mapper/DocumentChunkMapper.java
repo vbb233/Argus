@@ -71,6 +71,25 @@ public interface DocumentChunkMapper extends BaseMapper<DocumentChunkEntity> {
     );
 
     /**
+     * 按行名称精确查询行级分块（实体级检索通道）。
+     *
+     * <p>行级分块在入库时会把表格行的名称写入 {@code metadata_json.rowName}，
+     * 因此这里可以按名称<b>精确</b>匹配，而不是对整行文本做模糊匹配 ——
+     * 否则「软件工程」这种既是课程名、又出现在表名「软件工程专业课程设置表」里的词
+     * 会命中大量无关分块。</p>
+     *
+     * @param groupId  群组 ID
+     * @param rowName  行名称（如课程名）
+     * @param limit    最大返回条数
+     * @return 行级分块数据列表（Map 格式）
+     */
+    List<Map<String, Object>> selectRowChunksByRowName(
+            @Param("groupId") Long groupId,
+            @Param("rowName") String rowName,
+            @Param("limit") int limit
+    );
+
+    /**
      * 按切片 ID 批量查询 QA 就绪状态的切片。
      *
      * @param groupId  群组 ID

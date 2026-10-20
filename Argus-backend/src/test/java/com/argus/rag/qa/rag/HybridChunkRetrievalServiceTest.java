@@ -176,12 +176,56 @@ class HybridChunkRetrievalServiceTest {
 
         RetrievedEvidenceBundle bundle = service.retrieve(1L, question, 5);
 
-        assertThat(bundle.documents()).hasSize(2);
-        assertThat(bundle.documents().get(0).getText()).contains("doc1 chunk0 text");
-        assertThat(bundle.documents().get(1).getText()).contains("doc2 chunk0 text");
+        // GLOBAL 应遍历【全部切片】：doc1 有 2 个切片、doc2 有 1 个，共 3 条证据。
+        // 这条断言原本写成 2 —— 那是照着旧实现（每个文档只取 chunk 0）写的，
+        // 修好聚合问答后才暴露出来。
+        assertThat(bundle.documents()).hasSize(3);
+        assertThat(bundle.documents())
+                .extracting(Document::getText)
+                .anySatisfy(text -> assertThat(text).contains("doc1 chunk0 text"))
+                .anySatisfy(text -> assertThat(text).contains("doc1 chunk1 text"))
+                .anySatisfy(text -> assertThat(text).contains("doc2 chunk0 text"));
         assertThat(bundle.documents().get(0).getMetadata().get("documentId")).isEqualTo(10L);
         assertThat(bundle.documents().get(0).getMetadata().get("chunkIndex")).isEqualTo(0);
         assertThat(bundle.documents().get(0).getMetadata().get("retrievalSource")).isEqualTo("GLOBAL");
         assertThat(bundle.evidenceLevel()).isEqualTo(com.argus.rag.qa.model.EvidenceLevel.SUFFICIENT);
+    }
+
+    @Test
+    @DisplayName("全局遍历应跳过行级分块，避免重复注入与预算截断")
+    void shouldSkipTableRowChunksWhenTraversingGlobal() {
+        String question = "第5学期一共开设了多少门课程？";
+        HybridChunkRetrievalService service = new HybridChunkRetrievalService(
+                vectorRetrievalAdapter,
+                elasticsearchChunkIndexService,
+                youcomSearchService,
+                documentChunkMapper,
+                queryPlanningService,
+                documentMapper,
+                0
+        );
+
+        when(queryPlanningService.plan(question))
+                .thenReturn(new QueryPlanResult(QueryPlanStrategy.GLOBAL, List.of(question)));
+
+        com.argus.rag.document.model.entity.DocumentEntity doc = new com.argus.rag.document.model.entity.DocumentEntity();
+        doc.setId(10L);
+        doc.setGroupId(1L);
+        doc.setFileName("plan.pdf");
+        doc.setStatus("READY");
+        doc.setDeleted(false);
+        when(documentMapper.selectList(org.mockito.ArgumentMatchers.any(com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper.class)))
+                .thenReturn(List.of(doc));
+
+        DocumentChunkEntity regular = chunk(101L, 10L, 0, "常规分块：整张课程表");
+        DocumentChunkEntity rowChunk = chunk(102L, 10L, 1, "行级分块：1960073 软件工程 3 3 3 48 48");
+        rowChunk.setMetadataJson("{\"chunkStrategy\":\"table-row-v1\",\"rowName\":\"软件工程\"}");
+        when(documentChunkMapper.selectReadyActiveChunksByDocumentId(1L, 10L))
+                .thenReturn(List.of(regular, rowChunk));
+
+        RetrievedEvidenceBundle bundle = service.retrieve(1L, question, 5);
+
+        assertThat(bundle.documents()).as("只应注入常规分块，行级分块被跳过").hasSize(1);
+        assertThat(bundle.documents().get(0).getText()).contains("常规分块");
     }
 }

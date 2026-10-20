@@ -35,6 +35,8 @@ public class StructureAwareChunkTransformer implements DocumentTransformer {
                     + "|比例|占比|备注|说明|类型|类别|项目|内容|单位|合计|小计|成绩|分数|等级|状态");
     /** 纯数字单元格 */
     private static final Pattern NUMERIC_TOKEN = Pattern.compile("\\d+(?:\\.\\d+)?");
+    /** 7 位行编号（课程号等） */
+    private static final Pattern ROW_CODE = Pattern.compile("\\d{7}");
     /** 回填表头时加在分块开头的标记 */
     private static final String HEADER_PREFIX = "[表格表头] ";
     /** 回填表名时加在分块开头的标记 */
@@ -151,8 +153,61 @@ public class StructureAwareChunkTransformer implements DocumentTransformer {
         metadata.put("charStart", charStart);
         metadata.put("charEnd", charStart + row.length());
         metadata.put("chunkStrategy", ROW_STRATEGY);
+        // 把行内的「编号 + 名称」抽成结构化字段，供实体级检索（按名称精确查行）使用。
+        // 若只存整行文本，按名称做 LIKE 查询会误命中表名（表名里也常含专业/课程名），
+        // 例如「软件工程」既出现在表名「软件工程专业课程设置表」里，也是一门课程的名字。
+        RowIdentity identity = parseRowIdentity(row);
+        if (identity != null) {
+            if (identity.code() != null) {
+                metadata.put("rowCode", identity.code());
+            }
+            metadata.put("rowName", identity.name());
+        }
         String id = source.getId() == null ? null : source.getId() + ":" + chunkIndex;
         return Document.builder().id(id).text(text.toString()).metadata(metadata).build();
+    }
+
+    /**
+     * 解析数据行的「编号 + 名称」。
+     *
+     * <p>形如 {@code 1960073 软件工程 3 3 3 48 48}：开头 7 位课程号，
+     * 结尾是一串数字列，中间即名称。名称内部可能含空格
+     * （如 {@code 分布式数据库 GaussDB 设计 与应用}），因此按「从头取编号、
+     * 从尾剥离数字列」的方式切分，而不是按固定列位置。</p>
+     *
+     * @param row 数据行
+     * @return 解析结果；结构不符合时返回 {@code null}
+     */
+    private RowIdentity parseRowIdentity(String row) {
+        String[] tokens = row.strip().split("\\s+");
+        if (tokens.length < 3) {
+            return null;
+        }
+        int end = tokens.length;
+        while (end > 0 && NUMERIC_TOKEN.matcher(tokens[end - 1]).matches()) {
+            end--;
+        }
+        if (end <= 1) {
+            return null;
+        }
+        String code = ROW_CODE.matcher(tokens[0]).matches() ? tokens[0] : null;
+        int nameStart = code == null ? 0 : 1;
+        if (end <= nameStart) {
+            return null;
+        }
+        StringBuilder name = new StringBuilder();
+        for (int i = nameStart; i < end; i++) {
+            if (name.length() > 0) {
+                name.append(' ');
+            }
+            name.append(tokens[i]);
+        }
+        String normalized = name.toString().strip();
+        return normalized.isEmpty() ? null : new RowIdentity(code, normalized);
+    }
+
+    /** 数据行的编号与名称。 */
+    private record RowIdentity(String code, String name) {
     }
 
     // 收集标题并将文本按标题边界拆分为章节列表

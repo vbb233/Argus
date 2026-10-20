@@ -10,6 +10,7 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.argus.rag.qa.model.EvidenceLevel;
 import com.argus.rag.qa.model.QueryPlanResult;
 import com.argus.rag.qa.service.QueryPlanningService;
+import com.argus.rag.qa.support.TableEntityExtractor;
 import com.argus.rag.engine.elasticsearch.ElasticsearchChunkIndexService;
 import com.argus.rag.engine.pgvector.PgVectorRetrievalAdapter;
 import com.argus.rag.engine.youcom.YoucomSearchService;
@@ -76,6 +77,9 @@ public class HybridChunkRetrievalService {
      * 并且字符预算会提前触顶。</p>
      */
     private static final String TABLE_ROW_STRATEGY_MARKER = "table-row-v1";
+
+    /** 实体级通道最多置顶多少条行级证据 */
+    private static final int MAX_ENTITY_ROW_EVIDENCE = 3;
 
     /** 向量检索适配器 */
     private final PgVectorRetrievalAdapter vectorRetrievalAdapter;
@@ -230,6 +234,22 @@ public class HybridChunkRetrievalService {
         log.info("You.com 搜索结果追加完成: groupId={}, webResults={}",
                 validGroupId, evidenceIndex - rankedClusters.size() - 1);
 
+        // 实体级检索通道：问题点名具体实体（如课程名）时，按名称精确查行级分块并置顶。
+        //
+        // 为什么必须绕开排序：这类分块在向量/关键词两路里都可能排不进 top-k ——
+        // 关键词通道会被大段叙述文字淹没（「软件工程」作为专业名出现在十余个分块里），
+        // 但一旦按名称精确命中，它就是唯一含该实体的表格行，价值高于任何相关性排序结果。
+        List<Document> entityRowDocuments =
+                collectEntityRowEvidence(validGroupId, normalizedQuestion, documents);
+        if (!entityRowDocuments.isEmpty()) {
+            List<Document> merged = new ArrayList<>(entityRowDocuments);
+            merged.addAll(documents);
+            documents = renumberEvidenceIds(merged);
+            log.info("实体级检索通道命中: groupId={}, entity={}, rowEvidence={}",
+                    validGroupId, TableEntityExtractor.extractEntity(normalizedQuestion),
+                    entityRowDocuments.size());
+        }
+
         EvidenceLevel evidenceLevel = evaluateEvidenceLevel(documents);
         long elapsedMs = (System.nanoTime() - startNano) / 1_000_000;
         log.info("混合检索完成: groupId={}, evidenceCount={}, evidenceLevel={}, elapsedMs={}",
@@ -261,6 +281,95 @@ public class HybridChunkRetrievalService {
     private boolean isTableRowChunk(DocumentChunkEntity chunk) {
         String metadata = chunk.getMetadataJson();
         return metadata != null && metadata.contains(TABLE_ROW_STRATEGY_MARKER);
+    }
+
+    /**
+     * 实体级检索通道：按实体名精确取回行级分块。
+     *
+     * <p>行级分块入库时把表格行的名称写入 {@code metadata_json.rowName}，
+     * 因此这里按名称<b>精确</b>匹配。若改为对整行文本做模糊匹配，
+     * 「软件工程」这类既是课程名、又出现在表名「软件工程专业课程设置表」里的词
+     * 会命中全部行级分块，等于没有筛选。</p>
+     *
+     * @param groupId        群组 ID
+     * @param question       用户问题
+     * @param existing       已经组装好的证据（用于去重）
+     * @return 需要置顶的证据列表；无实体或无命中时返回空列表
+     */
+    private List<Document> collectEntityRowEvidence(Long groupId, String question,
+                                                    List<Document> existing) {
+        String entity = TableEntityExtractor.extractEntity(question);
+        if (entity == null) {
+            return List.of();
+        }
+        Set<Object> existingChunkIds = new LinkedHashSet<>();
+        for (Document document : existing) {
+            Object chunkId = document.getMetadata().get("chunkId");
+            if (chunkId != null) {
+                existingChunkIds.add(chunkId);
+            }
+        }
+        List<Map<String, Object>> rows = documentChunkMapper.selectRowChunksByRowName(
+                groupId, entity, MAX_ENTITY_ROW_EVIDENCE);
+        if (rows == null || rows.isEmpty()) {
+            return List.of();
+        }
+        List<Document> documents = new ArrayList<>();
+        for (Map<String, Object> row : rows) {
+            // 注意：PostgreSQL 会把未加引号的列别名折成小写，因此必须走 getValue
+            // 做驼峰/小写兼容查找；直接用 row.get("chunkId") 会拿到 null，
+            // 症状是实体通道静默失效、一条证据都加不进来。
+            Object chunkId = getValue(row, "chunkId");
+            Object chunkText = getValue(row, "chunkText");
+            if (chunkId == null || chunkText == null || String.valueOf(chunkText).isBlank()) {
+                continue;
+            }
+            if (!existingChunkIds.add(chunkId)) {
+                continue;
+            }
+            Map<String, Object> metadata = new LinkedHashMap<>();
+            metadata.put("groupId", groupId);
+            metadata.put("documentId", getValue(row, "documentId"));
+            metadata.put("chunkId", chunkId);
+            metadata.put("chunkIndex", getValue(row, "chunkIndex"));
+            metadata.put("fileName", getValue(row, "fileName"));
+            metadata.put("score", 1.0D);
+            metadata.put("retrievalSource", "ENTITY_ROW");
+            metadata.put("coverageMode", "ENTITY_ROW");
+            metadata.put("entity", entity);
+            documents.add(Document.builder()
+                    .id("E0")
+                    .text(String.valueOf(chunkText))
+                    .metadata(metadata)
+                    .build());
+        }
+        return documents;
+    }
+
+    /**
+     * 重新给证据编号 E1..En。
+     *
+     * <p>实体级通道把证据插到最前面后，原有编号会冲突，因此统一重排。
+     * 编号是下游引用的锚点（{@code citations} 与提示词都按编号指代证据），必须连续。</p>
+     *
+     * @param documents 证据列表
+     * @return 编号重排后的证据列表
+     */
+    private List<Document> renumberEvidenceIds(List<Document> documents) {
+        List<Document> renumbered = new ArrayList<>(documents.size());
+        int index = 1;
+        for (Document document : documents) {
+            String evidenceId = "E" + index;
+            Map<String, Object> metadata = new LinkedHashMap<>(document.getMetadata());
+            metadata.put("evidenceId", evidenceId);
+            renumbered.add(Document.builder()
+                    .id(evidenceId)
+                    .text(document.getText())
+                    .metadata(metadata)
+                    .build());
+            index++;
+        }
+        return renumbered;
     }
 
     private RetrievedEvidenceBundle retrieveGlobal(Long groupId, String question) {

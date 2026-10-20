@@ -3,6 +3,7 @@ package com.argus.rag.qa.service;
 import com.argus.rag.common.exception.BusinessException;
 import com.argus.rag.qa.model.QueryPlanResult;
 import com.argus.rag.qa.model.QueryPlanStrategy;
+import com.argus.rag.qa.support.TableEntityExtractor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
@@ -53,29 +54,9 @@ public class QueryPlanningService {
                     + "|各学期|每个学期|每学期");
 
     /**
-     * 提问用语 → 文档列名的词汇映射，用于<b>检索查询蒸馏</b>（不进入生成提示词）。
-     *
-     * <p>表格的列名是文档自己的措辞（「授课学期」），而用户自然会说
-     * 「在第几学期开课」。两者词面完全不重叠，关键词检索于是只能靠课程名
-     * 这类高词频词排序，大段叙述文字反而胜出。</p>
-     *
-     * <p>实测（同一份培养方案、同一个问题「软件工程在第几学期开课？」，
-     * 目标分块为含该课程行的行级分块）：</p>
-     * <pre>
-     *   "软件工程在第几学期开课"           -> 目标分块排第 10 位（进不了 top-5）
-     *   "软件工程在第几学期开课 授课学期"  -> 排第  7 位（只加词没用）
-     *   "软件工程 授课学期"               -> 排第  2 位  ← 蒸馏后才有效
-     * </pre>
-     *
-     * <p><b>为什么"加词"无效而"蒸馏"有效</b>：长查询里的
-     * 「在 / 第 / 几 / 学期 / 开课」这些通用词在大段叙述文中反复出现，
-     * 把目标分块压了下去；只有把查询压缩成「实体 + 列名」，
-     * 词密度才回到目标分块这一侧。</p>
+     * 提问用语 → 文档列名的映射已下沉到 {@link TableEntityExtractor}，
+     * 因为「实体级检索」通道也要用同一套抽取规则，避免两处各写一份而逐渐漂移。
      */
-    private static final List<Map.Entry<Pattern, String>> TABLE_LOOKUPS = List.of(
-            Map.entry(Pattern.compile("^\\s*(.+?)\\s*在?第几(?:个)?学期"), "授课学期"),
-            Map.entry(Pattern.compile("^\\s*(.+?)\\s*(?:是|有)?(?:几|多少)个?学分"), "学分"),
-            Map.entry(Pattern.compile("^\\s*(.+?)\\s*(?:是|有)?(?:几|多少)个?学时"), "学时"));
 
     private final ChatClient queryPlanningChatClient;
     private final PromptTemplate queryPlanningUserPromptTemplate;
@@ -133,38 +114,13 @@ public class QueryPlanningService {
      * 把「实体 + 口语化属性问法」的问题蒸馏成「实体 + 文档列名」的检索查询。
      *
      * <p>例如「软件工程在第几学期开课？」蒸馏为 {@code 软件工程 授课学期}。
-     * 仅在能明确抽出实体时生效；抽出结果不像实体（过长、含指示代词）时返回
-     * {@code null}，保持原有检索行为不变。</p>
+     * 具体抽取规则见 {@link TableEntityExtractor}。</p>
      *
      * @param question 用户问题
      * @return 蒸馏后的查询；无法蒸馏时返回 {@code null}
      */
     static String distilledTableQuery(String question) {
-        if (question == null) {
-            return null;
-        }
-        for (Map.Entry<Pattern, String> entry : TABLE_LOOKUPS) {
-            Matcher matcher = entry.getKey().matcher(question);
-            if (!matcher.find()) {
-                continue;
-            }
-            String entity = matcher.group(1).strip();
-            if (!looksLikeEntity(entity)) {
-                return null;
-            }
-            return entity + " " + entry.getValue();
-        }
-        return null;
-    }
-
-    // 判断抽出的片段是否像一个具体实体名（课程名等）
-    private static boolean looksLikeEntity(String candidate) {
-        if (candidate.length() < 2 || candidate.length() > 24) {
-            return false;
-        }
-        return !candidate.contains("这门") && !candidate.contains("那门")
-                && !candidate.contains("该课程") && !candidate.contains("这个")
-                && !candidate.contains("它");
+        return TableEntityExtractor.distilledQuery(question);
     }
 
     /**
